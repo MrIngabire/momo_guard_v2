@@ -9,10 +9,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# ML artifacts (regeneratable)
-backend/rf_model.pkl
-backend/vectorizer.pkl
-backend/metrics.json
+# ML artifacts (regeneratable, anywhere under backend/)
+**/rf_model.pkl
+**/vectorizer.pkl
+**/metrics.json
 
 # Local DB (shouldn't exist in v2, but just in case)
 backend/*.db
