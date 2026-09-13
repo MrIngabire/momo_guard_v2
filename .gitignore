@@ -12,7 +12,7 @@ __pycache__/
 # ML artifacts (regeneratable, anywhere under backend/)
 **/rf_model.pkl
 **/vectorizer.pkl
-**/metrics.json
+backend/metrics.json
 
 # Local DB (shouldn't exist in v2, but just in case)
 backend/*.db

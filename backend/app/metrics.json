@@ -1,1 +1,0 @@
-{"accuracy": 0.823529411764706, "accuracy_std": 0.12338927625531192, "samples": 85, "cv_folds": 5, "model": "RandomForestClassifier"}
