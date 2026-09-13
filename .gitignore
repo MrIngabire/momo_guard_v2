@@ -1,0 +1,36 @@
+# ---- Python / FastAPI backend ----
+backend/.env
+backend/venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ML artifacts (regeneratable)
+backend/rf_model.pkl
+backend/vectorizer.pkl
+backend/metrics.json
+
+# Local DB (shouldn't exist in v2, but just in case)
+backend/*.db
+backend/*.sqlite3
+
+# ---- Node / Vite frontend ----
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.local
+npm-debug.log*
+yarn-error.log*
+
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
