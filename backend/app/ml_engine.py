@@ -20,12 +20,21 @@ MODEL_PATH = os.path.join(BASE_DIR, "rf_model.pkl")
 VECTORIZER_PATH = os.path.join(BASE_DIR, "vectorizer.pkl")
 METRICS_PATH = os.path.join(BASE_DIR, "metrics.json")
 
-CONFIDENCE_LOW = 0.15
-CONFIDENCE_HIGH = 0.85
+# --- Trust thresholds --------------------------------------------------------
+# ML is trusted only when its score is OUTSIDE this band.
+# Anything in [LOW, HIGH] goes to Gemini for a second opinion.
+CONFIDENCE_LOW = 0.25
+CONFIDENCE_HIGH = 0.75
+
+# ML is also skipped entirely if the input matches fewer than this many
+# vocabulary tokens. Prevents the RF from guessing on low-signal inputs
+# like "hello" or "hy".
+MIN_TOKEN_MATCHES = 3
 
 _gemini_client = None
 if settings.GEMINI_API_KEY:
     _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    print("[ML] Gemini client initialised.")
 else:
     print("[ML] WARNING: GEMINI_API_KEY not set — Gemini fallback disabled.")
 
@@ -49,6 +58,9 @@ def _train_model():
     texts = [t for t, _ in TRAINING_DATA]
     labels = [y for _, y in TRAINING_DATA]
 
+    # v2 vectorizer: keep it aligned with v1 but make it a bit more robust.
+    # min_df=1 + a token-count guard in _ml_predict() is safer than min_df=2
+    # for a small corpus.
     _ml_vectorizer = TfidfVectorizer(
         lowercase=True,
         ngram_range=(1, 2),
@@ -83,6 +95,7 @@ def _train_model():
         "accuracy": cv_accuracy,
         "accuracy_std": cv_std,
         "samples": len(texts),
+        "vocabulary_size": len(_ml_vectorizer.vocabulary_),
         "cv_folds": 5,
         "model": "RandomForestClassifier",
     }
@@ -125,23 +138,35 @@ def get_metrics():
     return _last_metrics or {}
 
 
-def _ml_predict(text):
+def _ml_predict(text: str):
+    """
+    Returns (fraud_score | None, reason).
+    fraud_score is None when the ML cannot make a reliable prediction.
+    """
     if not _load_or_train():
         return None, "ml unavailable"
+
     try:
         vec = _ml_vectorizer.transform([text])
+
+        # Guard 1: no known tokens matched at all
         if vec.nnz == 0:
-            return None, "no known tokens matched"
+            return None, "no known tokens matched (unseen vocabulary)"
+
+        # Guard 2: too few signals to trust the RF
+        if vec.nnz < MIN_TOKEN_MATCHES:
+            return None, f"only {vec.nnz} token match(es) — too low signal"
+
         proba = _ml_model.predict_proba(vec)[0]
         classes = list(_ml_model.classes_)
         score = float(proba[classes.index(1)]) if 1 in classes else float(proba[-1])
-        return score, "ml scored"
+        return score, f"ml scored (nnz={vec.nnz})"
     except Exception as e:
         print(f"[ML] prediction failed: {e}")
         return None, f"ml error: {e}"
 
 
-def _gemini_predict(text):
+def _gemini_predict(text: str):
     if not _gemini_client:
         return None
     try:
@@ -161,6 +186,7 @@ SMS Text: "{text}"
         )
         m = re.search(r"\{.*\}", response.text, re.DOTALL)
         if not m:
+            print("[ML] Gemini returned no parsable JSON.")
             return None
         data = json.loads(m.group(0))
         score = float(data.get("fraud_score", 0.0))
@@ -178,17 +204,23 @@ def predict_sms(text: str) -> dict:
     ml_score, reason = _ml_predict(text)
 
     if ml_score is not None:
+        # High confidence → trust ML
         if ml_score < CONFIDENCE_LOW or ml_score > CONFIDENCE_HIGH:
+            print(f"[ML] ML answered {ml_score:.2f} ({reason}) — high confidence, using ML.")
             return {
                 "fraud_score": round(ml_score, 4),
                 "classification_tag": _three_tier(ml_score),
                 "suspicious_keywords": [],
                 "engine": "ml",
             }
+
+        # Ambiguous → ask Gemini
+        print(f"[ML] ML score {ml_score:.2f} is ambiguous — consulting Gemini.")
         gem = _gemini_predict(text)
         if gem:
             gem["engine"] = "gemini"
             return gem
+        print("[ML] Gemini failed; falling back to the ambiguous ML answer.")
         return {
             "fraud_score": round(ml_score, 4),
             "classification_tag": _three_tier(ml_score),
@@ -196,11 +228,14 @@ def predict_sms(text: str) -> dict:
             "engine": "ml",
         }
 
+    # ML skipped → go straight to Gemini
+    print(f"[ML] ML skipped ({reason}) — using Gemini directly.")
     gem = _gemini_predict(text)
     if gem:
         gem["engine"] = "gemini"
         return gem
 
+    print("[ML] All engines failed. Returning safe default.")
     return {
         "fraud_score": 0.05,
         "classification_tag": "Safe",
