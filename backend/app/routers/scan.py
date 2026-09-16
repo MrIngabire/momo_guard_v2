@@ -22,8 +22,13 @@ def _detect_language(text: str) -> str:
     return "unknown"
 
 
-def _run_scan(db: Session, sender: str, text: str, analyst_id: str | None):
-    prediction = predict_sms(text)
+def _run_scan(
+    db: Session,
+    sender: str,
+    text: str,
+    analyst_id: str | None,
+):
+    prediction = predict_sms(text, sender=sender, db=db)
     language = _detect_language(text)
 
     scan_row = SmsScan(
@@ -52,7 +57,6 @@ def _run_scan(db: Session, sender: str, text: str, analyst_id: str | None):
     }
 
 
-# ---------- Authenticated scan (dashboard / web) ----------
 @router.post("/scan", response_model=ScanResponse)
 def scan(
     payload: ScanRequest,
@@ -63,7 +67,6 @@ def scan(
     return _run_scan(db, payload.sender, payload.text, user.user_id)
 
 
-# ---------- Public scan (mobile app, no auth) ----------
 @router.post("/scan-public", response_model=ScanResponse)
 def scan_public(
     payload: ScanRequest,
@@ -71,8 +74,7 @@ def scan_public(
 ):
     """
     Public endpoint used by the native Android client.
-    No JWT required — the phone posts { sender, text } and gets
-    a classification back. The scan is still logged with analyst_id=None.
+    No JWT required. The scan is logged with analyst_id=None.
     """
     return _run_scan(db, payload.sender, payload.text, None)
 

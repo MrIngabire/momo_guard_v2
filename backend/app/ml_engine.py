@@ -9,9 +9,16 @@ from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.training_data import TRAINING_DATA
+from app.trusted_senders import (
+    is_trusted,
+    TRUST_SCORE_CAP,
+    BLACKLIST_SCORE_FLOOR,
+    TRUST_BYPASS_CEILING,
+)
 
 load_dotenv()
 
@@ -21,16 +28,29 @@ VECTORIZER_PATH = os.path.join(BASE_DIR, "vectorizer.pkl")
 METRICS_PATH = os.path.join(BASE_DIR, "metrics.json")
 
 # --- Trust thresholds --------------------------------------------------------
-# ML is trusted only when its score is OUTSIDE this band.
-# Anything in [LOW, HIGH] goes to Gemini for a second opinion.
-CONFIDENCE_LOW = 0.25
-CONFIDENCE_HIGH = 0.75
-
-# ML is also skipped entirely if the input matches fewer than this many
-# vocabulary tokens. Prevents the RF from guessing on low-signal inputs
-# like "hello" or "hy".
+CONFIDENCE_LOW = 0.35
+CONFIDENCE_HIGH = 0.65
 MIN_TOKEN_MATCHES = 3
 
+# --- Receipt pattern bypass --------------------------------------------------
+# If a message matches one of these patterns, it's structurally an MTN MoMo
+# receipt and doesn't need ML analysis. Scammers cannot fabricate a real FT Id.
+RECEIPT_PATTERNS = [
+    r"FT Id:\s*\d+",
+    r"Balance:\s*\d+\s*RWF",
+    r"Fee:\s*\d+\s*RWF",
+    r"\*165\*S\*",
+    r"transferred to .+\(\d+\)\s+at\s+\d{4}-\d{2}-\d{2}",
+    r"received \d+\s*RWF from .+\s+at\s+\d{4}-\d{2}-\d{2}",
+]
+_RECEIPT_REGEX = re.compile("|".join(RECEIPT_PATTERNS), re.IGNORECASE)
+
+
+def _looks_like_receipt(text: str) -> bool:
+    return bool(_RECEIPT_REGEX.search(text))
+
+
+# --- Gemini client -----------------------------------------------------------
 _gemini_client = None
 if settings.GEMINI_API_KEY:
     _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -58,9 +78,6 @@ def _train_model():
     texts = [t for t, _ in TRAINING_DATA]
     labels = [y for _, y in TRAINING_DATA]
 
-    # v2 vectorizer: keep it aligned with v1 but make it a bit more robust.
-    # min_df=1 + a token-count guard in _ml_predict() is safer than min_df=2
-    # for a small corpus.
     _ml_vectorizer = TfidfVectorizer(
         lowercase=True,
         ngram_range=(1, 2),
@@ -139,24 +156,14 @@ def get_metrics():
 
 
 def _ml_predict(text: str):
-    """
-    Returns (fraud_score | None, reason).
-    fraud_score is None when the ML cannot make a reliable prediction.
-    """
     if not _load_or_train():
         return None, "ml unavailable"
-
     try:
         vec = _ml_vectorizer.transform([text])
-
-        # Guard 1: no known tokens matched at all
         if vec.nnz == 0:
             return None, "no known tokens matched (unseen vocabulary)"
-
-        # Guard 2: too few signals to trust the RF
         if vec.nnz < MIN_TOKEN_MATCHES:
             return None, f"only {vec.nnz} token match(es) — too low signal"
-
         proba = _ml_model.predict_proba(vec)[0]
         classes = list(_ml_model.classes_)
         score = float(proba[classes.index(1)]) if 1 in classes else float(proba[-1])
@@ -166,10 +173,11 @@ def _ml_predict(text: str):
         return None, f"ml error: {e}"
 
 
-def _gemini_predict(text: str):
+def _gemini_predict(text: str, sender: str | None = None):
     if not _gemini_client:
         return None
     try:
+        sender_line = f'From: "{sender}"\n' if sender else ""
         prompt = f"""You are an elite cybersecurity AI analyzing SMS for Mobile Money (MoMo) fraud in Rwanda.
 The text may be in Kinyarwanda, English, or French.
 Return ONLY a raw JSON dictionary, no markdown, no prose.
@@ -177,8 +185,10 @@ Required format:
 {{"fraud_score": 0.95, "classification_tag": "Scam", "suspicious_keywords": ["word1"]}}
 
 IMPORTANT: classification_tag MUST be exactly "Safe", "Suspicious", or "Scam".
+Note: "M-Money", "MTN", "MTN MoMo" are OFFICIAL MTN Rwanda MoMo sender IDs and their
+messages are legitimate transaction receipts unless the content is clearly suspicious.
 
-SMS Text: "{text}"
+{sender_line}SMS Text: "{text}"
 """
         response = _gemini_client.models.generate_content(
             model=settings.GEMINI_MODEL_NAME,
@@ -200,40 +210,134 @@ SMS Text: "{text}"
         return None
 
 
-def predict_sms(text: str) -> dict:
+def _apply_sender_trust(
+    result: dict,
+    sender: str | None,
+    db: Session | None = None,
+) -> dict:
+    """
+    Adjust the ML/Gemini result based on the sender ID.
+
+    - Trusted MTN sender  → cap score at TRUST_SCORE_CAP (unless raw ≥ 0.75)
+    - Blacklisted sender  → raise score to at least BLACKLIST_SCORE_FLOOR
+    """
+    if not sender:
+        return result
+
+    score = result["fraud_score"]
+
+    # --- Trusted sender ---
+    if is_trusted(sender):
+        if score < TRUST_BYPASS_CEILING:
+            capped = min(score, TRUST_SCORE_CAP)
+            result["fraud_score"] = round(capped, 4)
+            result["classification_tag"] = "Safe"
+            result["engine"] = f"{result.get('engine', 'ml')}+trusted"
+            print(
+                f"[ML] Trusted sender '{sender}' — capped {score:.2f} → {capped:.2f}"
+            )
+        else:
+            print(
+                f"[ML] Trusted sender '{sender}' but score {score:.2f} ≥ "
+                f"{TRUST_BYPASS_CEILING} — leaving decision to ML/Gemini."
+            )
+        return result
+
+    # --- Blacklisted sender ---
+    if db is not None:
+        try:
+            from app.models import Blacklist
+            entry = (
+                db.query(Blacklist)
+                .filter(Blacklist.phone_number == sender)
+                .first()
+            )
+            if entry and score < BLACKLIST_SCORE_FLOOR:
+                boosted = max(score, BLACKLIST_SCORE_FLOOR)
+                result["fraud_score"] = round(boosted, 4)
+                result["classification_tag"] = _three_tier(boosted)
+                result["engine"] = f"{result.get('engine', 'ml')}+blacklist"
+                print(
+                    f"[ML] Blacklisted sender '{sender}' — boosted "
+                    f"{score:.2f} → {boosted:.2f}"
+                )
+        except Exception as e:
+            print(f"[ML] Blacklist check failed: {e}")
+
+    return result
+
+
+def predict_sms(
+    text: str,
+    sender: str | None = None,
+    db: Session | None = None,
+) -> dict:
+    """
+    Main entry point.
+    Returns { fraud_score, classification_tag, suspicious_keywords, engine }.
+    engine values: 'rule', 'ml', 'gemini', 'fallback', plus '+trusted' / '+blacklist' suffixes.
+    """
+
+    # --- Fast path 1: sender is a trusted MTN shortcode ---
+    if sender and is_trusted(sender):
+        # Still scan for obvious scam signals (asking for PIN, external links)
+        suspicious = _has_scam_markers(text)
+        if not suspicious:
+            print(f"[ML] Trusted sender '{sender}' with clean content — Safe (trusted).")
+            return {
+                "fraud_score": 0.02,
+                "classification_tag": "Safe",
+                "suspicious_keywords": [],
+                "engine": "trusted",
+            }
+        else:
+            print(
+                f"[ML] Trusted sender '{sender}' but scam markers present — running full pipeline."
+            )
+
+    # --- Fast path 2: receipt-shaped message ---
+    if _looks_like_receipt(text):
+        print("[ML] Receipt pattern detected — Safe (rule).")
+        return {
+            "fraud_score": 0.02,
+            "classification_tag": "Safe",
+            "suspicious_keywords": [],
+            "engine": "rule",
+        }
+
+    # --- Standard ML → Gemini pipeline ---
     ml_score, reason = _ml_predict(text)
 
     if ml_score is not None:
-        # High confidence → trust ML
         if ml_score < CONFIDENCE_LOW or ml_score > CONFIDENCE_HIGH:
-            print(f"[ML] ML answered {ml_score:.2f} ({reason}) — high confidence, using ML.")
-            return {
+            print(f"[ML] ML answered {ml_score:.2f} ({reason}) — high confidence.")
+            result = {
                 "fraud_score": round(ml_score, 4),
                 "classification_tag": _three_tier(ml_score),
                 "suspicious_keywords": [],
                 "engine": "ml",
             }
+            return _apply_sender_trust(result, sender, db)
 
-        # Ambiguous → ask Gemini
         print(f"[ML] ML score {ml_score:.2f} is ambiguous — consulting Gemini.")
-        gem = _gemini_predict(text)
+        gem = _gemini_predict(text, sender)
         if gem:
             gem["engine"] = "gemini"
-            return gem
-        print("[ML] Gemini failed; falling back to the ambiguous ML answer.")
-        return {
+            return _apply_sender_trust(gem, sender, db)
+        print("[ML] Gemini failed; falling back to ambiguous ML answer.")
+        result = {
             "fraud_score": round(ml_score, 4),
             "classification_tag": _three_tier(ml_score),
             "suspicious_keywords": [],
             "engine": "ml",
         }
+        return _apply_sender_trust(result, sender, db)
 
-    # ML skipped → go straight to Gemini
     print(f"[ML] ML skipped ({reason}) — using Gemini directly.")
-    gem = _gemini_predict(text)
+    gem = _gemini_predict(text, sender)
     if gem:
         gem["engine"] = "gemini"
-        return gem
+        return _apply_sender_trust(gem, sender, db)
 
     print("[ML] All engines failed. Returning safe default.")
     return {
@@ -242,3 +346,24 @@ def predict_sms(text: str) -> dict:
         "suspicious_keywords": [],
         "engine": "fallback",
     }
+
+
+# --- Scam marker detection (used for trusted senders) -----------------------
+_SCAM_MARKER_PATTERNS = [
+    r"\bPIN\b",
+    r"\bpassword\b",
+    r"https?://(?!.*mtn\.rw)",
+    r"bit\.ly",
+    r"cliquez",
+    r"click here",
+    r"kanda\s+kuri",
+    r"verify your (account|identity)",
+    r"confirm your (account|identity)",
+    r"\burgent\b",
+    r"\bcompromised\b",
+]
+_SCAM_MARKER_REGEX = re.compile("|".join(_SCAM_MARKER_PATTERNS), re.IGNORECASE)
+
+
+def _has_scam_markers(text: str) -> bool:
+    return bool(_SCAM_MARKER_REGEX.search(text))
